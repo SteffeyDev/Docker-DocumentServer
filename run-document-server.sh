@@ -117,7 +117,6 @@ LOCAL_SERVICES=()
 PG_ROOT=/var/lib/postgresql
 PG_NAME=main
 PGDATA=${PG_ROOT}/${PG_VERSION}/${PG_NAME}
-PG_NEW_CLUSTER=false
 RABBITMQ_DATA=/var/lib/rabbitmq
 REDIS_DATA=/var/lib/redis
 
@@ -141,6 +140,8 @@ read_setting(){
   METRICS_HOST="${METRICS_HOST:-localhost}"
   METRICS_PORT="${METRICS_PORT:-8125}"
   METRICS_PREFIX="${METRICS_PREFIX:-.ds}"
+
+  NGINX_PORT=${NGINX_PORT:-80}
 
   DB_HOST=${DB_HOST:-${POSTGRESQL_SERVER_HOST:-$(${JSON} services.CoAuthoring.sql.dbHost)}}
   DB_TYPE=${DB_TYPE:-$(${JSON} services.CoAuthoring.sql.type)}
@@ -172,6 +173,8 @@ read_setting(){
   REDIS_SERVER_PORT=${REDIS_SERVER_PORT:-6379}
 
   DS_LOG_LEVEL=${DS_LOG_LEVEL:-$(${JSON_LOG} categories.default.level)}
+
+  DEFAULT_COEDITING_MODE=${DEFAULT_COEDITING_MODE:-strict}
 }
 
 deprecated_var() {
@@ -259,6 +262,12 @@ update_db_settings(){
   ${JSON} -I -e "this.services.CoAuthoring.sql.dbName = '${DB_NAME}'"
   ${JSON} -I -e "this.services.CoAuthoring.sql.dbUser = '${DB_USER}'"
   ${JSON} -I -e "this.services.CoAuthoring.sql.dbPass = '${DB_PWD}'"
+}
+
+update_editor_settings(){
+  ${JSON} -I -e "if(this.editorConfig===undefined)this.editorConfig={};"
+  ${JSON} -I -e "if(this.editorConfig.coEditing===undefined)this.editorConfig.coEditing={};"
+  ${JSON} -I -e "this.editorConfig.coEditing.mode = '$DEFAULT_COEDITING_MODE'"
 }
 
 update_rabbitmq_setting(){
@@ -487,6 +496,10 @@ update_nginx_settings(){
     ln -sf ${NGINX_ONLYOFFICE_PATH}/ds.conf.tmpl ${NGINX_ONLYOFFICE_CONF}
   fi
 
+  # Change default port
+  sed "s/listen 0.0.0.0:[0-9]*/listen 0.0.0.0:$NGINX_PORT/" -i ${NGINX_ONLYOFFICE_CONF}
+  sed "s/listen \[::\]:[0-9]*/listen [::]:$NGINX_PORT/" -i ${NGINX_ONLYOFFICE_CONF}
+
   # check if ipv6 supported otherwise remove it from nginx config
   if [ ! -f /proc/net/if_inet6 ]; then
     sed '/listen\s\+\[::[0-9]*\].\+/d' -i $NGINX_ONLYOFFICE_CONF
@@ -497,6 +510,10 @@ update_nginx_settings(){
   fi
 
   documentserver-update-securelink.sh -s ${SECURE_LINK_SECRET:-$(pwgen -s 20)} -r false
+
+  # Link onlyoffice conf to correct place for nginx to pick up
+  rm "${NGINX_CONFD_PATH}/ds.conf" || true
+  ln -s ${NGINX_ONLYOFFICE_CONF} "${NGINX_CONFD_PATH}/ds.conf"
 }
 
 update_log_settings(){
@@ -544,49 +561,17 @@ if [ ${ONLYOFFICE_DATA_CONTAINER_HOST} = "localhost" ]; then
 
   update_ds_settings
 
+  update_editor_settings
+
   # update settings by env variables
-  if [ $DB_HOST != "localhost" ]; then
-    update_db_settings
-    waiting_for_db
-    create_db_tbl
-  else
-    # change rights for postgres directory
-    chown -R postgres:postgres ${PG_ROOT}
-    chmod -R 700 ${PG_ROOT}
+  update_db_settings
+  waiting_for_db
+  create_db_tbl
 
-    # create new db if it isn't exist
-    if [ ! -d ${PGDATA} ]; then
-      create_postgresql_cluster
-      PG_NEW_CLUSTER=true
-    fi
-    LOCAL_SERVICES+=("postgresql")
-  fi
-
-  if [ ${AMQP_SERVER_HOST} != "localhost" ]; then
-    update_rabbitmq_setting
-  else
-    # change rights for rabbitmq directory
-    chown -R rabbitmq:rabbitmq ${RABBITMQ_DATA}
-    chmod -R go=rX,u=rwX ${RABBITMQ_DATA}
-    if [ -f ${RABBITMQ_DATA}/.erlang.cookie ]; then
-        chmod 400 ${RABBITMQ_DATA}/.erlang.cookie
-    fi
-
-    LOCAL_SERVICES+=("rabbitmq-server")
-    # allow Rabbitmq startup after container kill
-    rm -rf /var/run/rabbitmq
-  fi
+  update_rabbitmq_setting
 
   if [ ${REDIS_ENABLED} = "true" ]; then
-    if [ ${REDIS_SERVER_HOST} != "localhost" ]; then
-      update_redis_settings
-    else
-      # change rights for redis directory
-      chown -R redis:redis ${REDIS_DATA}
-      chmod -R 750 ${REDIS_DATA}
-
-      LOCAL_SERVICES+=("redis-server")
-    fi
+    update_redis_settings
   fi
 else
   # no need to update settings just wait for remote data
@@ -605,11 +590,6 @@ find /etc/${COMPANY_NAME} ! -path '*logrotate*' -exec chown ds:ds {} \;
 for i in ${LOCAL_SERVICES[@]}; do
   service $i start
 done
-
-if [ ${PG_NEW_CLUSTER} = "true" ]; then
-  create_postgresql_db
-  create_postgresql_tbl
-fi
 
 if [ ${ONLYOFFICE_DATA_CONTAINER} != "true" ]; then
   waiting_for_db
@@ -635,12 +615,6 @@ fi
 # nginx used as a proxy, and as data container status service.
 # it run in all cases.
 service nginx start
-
-if [ "${LETS_ENCRYPT_DOMAIN}" != "" -a "${LETS_ENCRYPT_MAIL}" != "" ]; then
-  if [ ! -f "${SSL_CERTIFICATE_PATH}" -a ! -f "${SSL_KEY_PATH}" ]; then
-    documentserver-letsencrypt.sh ${LETS_ENCRYPT_MAIL} ${LETS_ENCRYPT_DOMAIN}
-  fi
-fi
 
 # Regenerate the fonts list and the fonts thumbnails
 if [ "${GENERATE_FONTS}" == "true" ]; then
